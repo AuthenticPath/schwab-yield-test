@@ -1,0 +1,333 @@
+name: Schwab network smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-schwab:
+    name: Test from ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check playwright beautifulsoup4
+
+      - name: Install Chromium on Ubuntu
+        if: runner.os == 'Linux'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Chromium on macOS
+        if: runner.os == 'macOS'
+        run: python -m playwright install chromium
+
+      - name: Run Schwab smoke test
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          from html import unescape
+          from pathlib import Path
+
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+
+
+          TICKERS = ("SNVXX", "SNSXX", "SWTXX", "SWYXX", "SWKXX")
+          COMBINED_URLS = (
+              "https://www.schwab.com/money-market-funds",
+              "https://www.schwabassetmanagement.com/products/money-fund-yields",
+          )
+          PRODUCT_URLS = {
+              ticker: f"https://www.schwabassetmanagement.com/products/{ticker.lower()}"
+              for ticker in TICKERS
+          }
+          RUNNER = __import__("os").environ.get("MATRIX_OS", "unknown-runner")
+          SLUG = re.sub(r"[^a-z0-9]+", "-", RUNNER.lower()).strip("-")
+          OUTPUT_DIR = Path("artifacts") / SLUG
+          OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          PERCENT_RE = re.compile(r"(?<![\d.])(\d{1,2}(?:\.\d+)?)\s*%")
+          DATE_RE = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})")
+          AS_OF_RE = re.compile(
+              r"7[\s-]*day\s+yield\s*\(with\s+waivers\)[\s\S]{0,180}?as\s+of\s+(\d{1,2}/\d{1,2}/\d{4})",
+              re.I,
+          )
+          LABEL_RE = re.compile(r"7[\s-]*day\s+yield\s*\(with\s+waivers\)", re.I)
+
+
+          def clean_text(value):
+              return re.sub(r"\s+", " ", unescape(value or "")).strip()
+
+
+          def first_percent(value):
+              for match in PERCENT_RE.finditer(value or ""):
+                  number = float(match.group(1))
+                  if 0 <= number <= 20:
+                      return number
+              return None
+
+
+          def combined_as_of(text):
+              match = AS_OF_RE.search(text or "")
+              return match.group(1) if match else None
+
+
+          def parse_combined(text, source_url):
+              body = clean_text(text)
+              as_of = combined_as_of(body)
+              funds = []
+              for ticker in TICKERS:
+                  parsed = None
+                  for match in re.finditer(rf"\b{re.escape(ticker)}\b", body, re.I):
+                      window = body[match.end():match.end() + 500]
+                      value = first_percent(window)
+                      if value is not None:
+                          parsed = {
+                              "ticker": ticker,
+                              "yieldPct": value,
+                              "asOfDateRaw": as_of,
+                              "sourceUrl": source_url,
+                          }
+                          break
+                  if parsed:
+                      funds.append(parsed)
+              return funds
+
+
+          def parse_individual(text, ticker, source_url):
+              body = clean_text(text)
+              if ticker not in body.upper():
+                  return None
+              label = LABEL_RE.search(body)
+              if not label:
+                  return None
+              window = body[label.end():label.end() + 1200]
+              value = first_percent(window)
+              date_match = DATE_RE.search(window)
+              if value is None:
+                  return None
+              return {
+                  "ticker": ticker,
+                  "yieldPct": value,
+                  "asOfDateRaw": date_match.group(1) if date_match else None,
+                  "sourceUrl": source_url,
+              }
+
+
+          def complete(funds):
+              return len(funds) == len(TICKERS) and {item["ticker"] for item in funds} == set(TICKERS)
+
+
+          def safe_name(label):
+              return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+
+
+          def save_text(name, value):
+              path = OUTPUT_DIR / name
+              path.write_text(value or "", encoding="utf-8")
+              return str(path)
+
+
+          def direct_fetch(url, label, attempts, debug_files):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/150.0.0.0 Safari/537.36",
+                      "Accept": "text/html,application/xhtml+xml",
+                      "Accept-Language": "en-US,en;q=0.9",
+                  },
+              )
+              status = None
+              final_url = url
+              body = ""
+              error = None
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      status = response.status
+                      final_url = response.geturl()
+                      body = response.read().decode("utf-8", errors="replace")
+              except urllib.error.HTTPError as exc:
+                  status = exc.code
+                  final_url = exc.geturl()
+                  body = exc.read().decode("utf-8", errors="replace")
+              except Exception as exc:
+                  error = f"{type(exc).__name__}: {exc}"
+
+              title = None
+              text = ""
+              if body:
+                  soup = BeautifulSoup(body, "html.parser")
+                  title = clean_text(soup.title.get_text(" ")) if soup.title else None
+                  text = soup.get_text(" ")
+              attempt = {
+                  "method": "direct HTTP",
+                  "label": label,
+                  "url": url,
+                  "httpStatus": status,
+                  "finalUrl": final_url,
+                  "title": title,
+                  "responseLength": len(body),
+              }
+              if error:
+                  attempt["error"] = error
+              attempts.append(attempt)
+              if status != 200:
+                  debug_files.append(save_text(f"direct-{safe_name(label)}.html", body))
+              return status, text
+
+
+          def browser_fetch(page, url, label, attempts, debug_files):
+              status = None
+              body_text = ""
+              error = None
+              try:
+                  response = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                  page.wait_for_timeout(3_000)
+                  status = response.status if response else None
+                  body_text = page.locator("body").inner_text()
+              except Exception as exc:
+                  error = f"{type(exc).__name__}: {exc}"
+
+              attempt = {
+                  "method": "Chromium browser",
+                  "label": label,
+                  "url": url,
+                  "httpStatus": status,
+                  "finalUrl": page.url,
+                  "title": page.title() if page.url else None,
+                  "bodyLength": len(body_text),
+              }
+              if error:
+                  attempt["error"] = error
+              attempts.append(attempt)
+
+              if status != 200:
+                  stem = f"browser-{safe_name(label)}"
+                  try:
+                      html_path = OUTPUT_DIR / f"{stem}.html"
+                      html_path.write_text(page.content(), encoding="utf-8")
+                      debug_files.append(str(html_path))
+                  except Exception:
+                      pass
+                  try:
+                      png_path = OUTPUT_DIR / f"{stem}.png"
+                      page.screenshot(path=str(png_path), full_page=True)
+                      debug_files.append(str(png_path))
+                  except Exception:
+                      pass
+              return status, body_text
+
+
+          attempts = []
+          debug_files = []
+          funds = []
+          method = None
+
+          # First try ordinary direct HTML from both official Schwab hosts.
+          for url in COMBINED_URLS:
+              label = "retail combined page" if "www.schwab.com" in url else "asset-management combined page"
+              status, text = direct_fetch(url, label, attempts, debug_files)
+              if status == 200:
+                  candidate = parse_combined(text, url)
+                  if complete(candidate):
+                      funds = candidate
+                      method = f"direct HTTP: {label}"
+                      break
+
+          # If direct HTML did not work, try both hosts in a real Chromium browser.
+          if not complete(funds):
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch(headless=True)
+                  context = browser.new_context(
+                      locale="en-US",
+                      timezone_id="America/New_York",
+                      viewport={"width": 1440, "height": 1000},
+                  )
+                  page = context.new_page()
+
+                  for url in COMBINED_URLS:
+                      label = "retail combined page" if "www.schwab.com" in url else "asset-management combined page"
+                      status, text = browser_fetch(page, url, label, attempts, debug_files)
+                      if status == 200:
+                          candidate = parse_combined(text, url)
+                          if complete(candidate):
+                              funds = candidate
+                              method = f"Chromium browser: {label}"
+                              break
+
+                  # Final fallback: the five official individual product pages.
+                  if not complete(funds):
+                      individual_funds = []
+                      for ticker in TICKERS:
+                          url = PRODUCT_URLS[ticker]
+                          status, text = browser_fetch(
+                              page,
+                              url,
+                              f"individual product {ticker}",
+                              attempts,
+                              debug_files,
+                          )
+                          if status == 200:
+                              parsed = parse_individual(text, ticker, url)
+                              if parsed:
+                                  individual_funds.append(parsed)
+                      if complete(individual_funds):
+                          funds = individual_funds
+                          method = "Chromium browser: individual product pages"
+
+                  context.close()
+                  browser.close()
+
+          funds = sorted(funds, key=lambda item: TICKERS.index(item["ticker"]))
+          report = {
+              "version": "1.0",
+              "generatedAtUtc": datetime.now(timezone.utc).isoformat(),
+              "runner": RUNNER,
+              "readOnly": True,
+              "success": complete(funds),
+              "method": method,
+              "funds": funds,
+              "attempts": attempts,
+              "debugFiles": sorted(set(debug_files)),
+          }
+          report_path = OUTPUT_DIR / "schwab-github-smoke-test.json"
+          report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+          print(json.dumps(report, indent=2))
+          if report["success"]:
+              print("SUCCESS: GitHub extracted all five Schwab yields.")
+          else:
+              print("BLOCKED OR INCOMPLETE: download the artifact and inspect the report.")
+          PY
+
+      - name: Upload report and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schwab-smoke-test-${{ matrix.os }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
