@@ -4,7 +4,7 @@
   "yieldType": "7-day yield (with waivers)",
   "sourceUrl": "https://www.schwab.com/money-market-funds",
   "asOfDate": "2026-09-18",
-  "retrievedAtUtc": "2026-09-19T15:54:44.154082+00:00",
+  "retrievedAtUtc": "2026-09-20T16:10:42.948788+00:00",
   "funds": [
     {
       "ticker": "SNVXX",
