@@ -3,8 +3,8 @@
   "publisher": "Charles Schwab",
   "yieldType": "7-day yield (with waivers)",
   "sourceUrl": "https://www.schwab.com/money-market-funds",
-  "asOfDate": "2026-10-06",
-  "retrievedAtUtc": "2026-10-07T18:57:49.483113+00:00",
+  "asOfDate": "2026-10-07",
+  "retrievedAtUtc": "2026-10-08T18:52:21.315939+00:00",
   "funds": [
     {
       "ticker": "SNVXX",
@@ -16,15 +16,15 @@
     },
     {
       "ticker": "SWTXX",
-      "yieldPct": 2.9
+      "yieldPct": 2.87
     },
     {
       "ticker": "SWYXX",
-      "yieldPct": 3.05
+      "yieldPct": 3.01
     },
     {
       "ticker": "SWKXX",
-      "yieldPct": 2.62
+      "yieldPct": 2.61
     }
   ],
   "retrieval": {
